@@ -1196,7 +1196,12 @@ class Seestar:
                 "sec": now.second,
                 "time_zone": tz_name,
             }
-            date_data: MessageParams = {"method": "pi_set_time", "params": [date_json]}
+            # Firmware (e.g. 7.75) expects the time payload as an object, not a
+            # 1-element array; sending [date_json] yields code 107 "expected object
+            # param", so the clock never gets set -> wrong sidereal rate -> the stack
+            # rejects every frame as "star trails". Match the set_user_location call
+            # below, which passes a plain object and succeeds.
+            date_data: MessageParams = {"method": "pi_set_time", "params": date_json}
 
             do_AF = params.get("auto_focus", False)
             do_3PPA = params.get("3ppa", False)
