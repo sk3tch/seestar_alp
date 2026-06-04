@@ -1119,11 +1119,20 @@ class Seestar:
         self.schedule["is_stacking"] = True
         if "gain" in params:
             stack_gain = params["gain"]
-            result = self.send_message_param_sync(
-                {"method": "set_control_value", "params": ["gain", stack_gain]}
+            # Firmware (e.g. 7.75) expects the gain value as a string and rejects
+            # an int with code 105 "expected string param".
+            gain_result = self.send_message_param_sync(
+                {"method": "set_control_value", "params": ["gain", str(stack_gain)]}
             )
-            self.logger.info(result)
-        return "error" not in result
+            self.logger.info(gain_result)
+            if "error" in gain_result:
+                self.logger.warning(
+                    "Stack started but setting gain failed (continuing): %s", gain_result
+                )
+        # The stack started successfully; a non-fatal gain-set error must NOT abort
+        # the panel (previously this returned the gain call's result, which made the
+        # mosaic skip the whole panel and "finish" in well under a second).
+        return True
 
     def get_last_image(self, params):
         album_result = self.send_message_param_sync({"method": "get_albums"})
