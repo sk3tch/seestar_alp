@@ -613,6 +613,13 @@ class Seestar:
                 if isinstance(existing_params, list) and existing_params:
                     if existing_params[-1] == "verify":
                         return data
+                    # Firmware 7.06+ (2706+) also rejects verify injected into LIST
+                    # params: [list, "verify"] yields code 107 "expected object param"
+                    # (this is what broke pi_set_time -> clock never set -> star trails).
+                    # The device is SSL-authenticated, so list-param commands don't need
+                    # verify on 7.06+ either. Mirror the dict-params guard above.
+                    if getattr(self, "firmware_ver_int", 0) >= 2706:
+                        return data
 
                 if data.get("method") == "set_wheel_position" and isinstance(
                     existing_params, list
@@ -650,6 +657,13 @@ class Seestar:
         else:
             cur_cmdid = self.send_message_param(data)
 
+        # Slow operations (mount slew, park, autofocus, polar align) routinely take
+        # longer than the default 10s wait; give them more time before bailing so we
+        # actually get the result (e.g. scope_park takes ~15s).
+        slow_methods = {"scope_park", "scope_goto", "start_auto_focuse",
+                        "start_polar_align", "iscope_start_view"}
+        wait_limit = 45 if data.get("method") in slow_methods else 10
+
         start = time.time()
         last_slow = start
         while cur_cmdid not in self.response_dict:
@@ -657,7 +671,7 @@ class Seestar:
             if now - last_slow > 2:
                 elapsed = now - start
                 last_slow = now
-                if elapsed > 10:
+                if elapsed > wait_limit:
                     self.logger.error(
                         f"Failed to wait for message response.  {elapsed} seconds. {cur_cmdid=} {data=}"
                     )
@@ -669,8 +683,19 @@ class Seestar:
                     )
                     # todo : dump out stats.  last run time on threads, connection status, etc.
             time.sleep(0.5)
-        self.logger.debug(f"response is {self.response_dict[cur_cmdid]}")
-        return self.response_dict[cur_cmdid]
+        resp = self.response_dict[cur_cmdid]
+        # Surface device-side command failures (e.g. code 105/107/109 "expected ...
+        # param") that callers would otherwise silently ignore -- these are how the
+        # gain/clock bugs hid for so long.
+        if isinstance(resp, dict) and (
+            "error" in resp or resp.get("code", 0) not in (0, None)
+        ):
+            self.logger.warning(
+                "device command %r returned error: code=%s error=%r",
+                data.get("method"), resp.get("code"), resp.get("error"),
+            )
+        self.logger.debug(f"response is {resp}")
+        return resp
 
     def get_event_state(self, params=None):
         if "scheduler" not in self.event_state:
@@ -974,7 +999,7 @@ class Seestar:
             self.logger.error("Faild to start create darks: %s", result)
             return False
         response = self.send_message_param_sync(
-            {"method": "set_control_value", "params": ["gain", Config.init_gain]}
+            {"method": "set_control_value", "params": ["gain", str(Config.init_gain)]}
         )
         self.logger.info(f"dark frame measurement setting gain response: {response}")
         result = self.wait_end_op("DarkLibrary")
@@ -1874,9 +1899,18 @@ class Seestar:
                     # be sure we are using the right target name before we stack
                     self.set_target_name(save_target_name)
 
-                    if not self.start_stack(
-                        {"gain": gain, "restart": True, "stack_type": stack_type}
-                    ):
+                    stack_started = False
+                    for stack_try in range(2):
+                        if self.start_stack(
+                            {"gain": gain, "restart": True, "stack_type": stack_type}
+                        ):
+                            stack_started = True
+                            break
+                        self.logger.warning(
+                            "start_stack failed (attempt %d/2); retrying", stack_try + 1
+                        )
+                        time.sleep(2)
+                    if not stack_started:
                         msg = "Failed to start stacking."
                         self.logger.warning(msg)
                         self.event_state["scheduler"]["cur_scheduler_item"][

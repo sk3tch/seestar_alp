@@ -82,19 +82,31 @@ def test_transform_message_for_verify_dict_params(seestar):
 
 
 def test_transform_message_for_verify_list_params(seestar):
-    seestar.firmware_ver_int = 3000
     old_setting = Config.verify_injection
     try:
         Config.verify_injection = True
+
+        # Pre-7.06 firmware: list params get verify-wrapped (legacy behavior).
+        seestar.firmware_ver_int = 2705
         out = seestar.transform_message_for_verify(
             {"method": "scope_goto", "params": [12.3, 45.6]}
         )
         assert out["params"] == [[12.3, 45.6], "verify"]
-
         wheel = seestar.transform_message_for_verify(
             {"method": "set_wheel_position", "params": [1]}
         )
         assert wheel["params"] == [1, "verify"]
+
+        # 7.06+ firmware: verify must NOT be injected into list params either
+        # ([list, "verify"] -> code 107). Returned unchanged -- this is the
+        # pi_set_time / clock fix.
+        seestar.firmware_ver_int = 2706
+        assert seestar.transform_message_for_verify(
+            {"method": "scope_goto", "params": [12.3, 45.6]}
+        )["params"] == [12.3, 45.6]
+        assert seestar.transform_message_for_verify(
+            {"method": "pi_set_time", "params": [{"year": 2026}]}
+        )["params"] == [{"year": 2026}]
     finally:
         Config.verify_injection = old_setting
 
