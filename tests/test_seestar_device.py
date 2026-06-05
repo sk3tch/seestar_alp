@@ -82,19 +82,31 @@ def test_transform_message_for_verify_dict_params(seestar):
 
 
 def test_transform_message_for_verify_list_params(seestar):
-    seestar.firmware_ver_int = 3000
     old_setting = Config.verify_injection
     try:
         Config.verify_injection = True
+
+        # Pre-7.06 firmware: list params get verify-wrapped (legacy behavior).
+        seestar.firmware_ver_int = 2705
         out = seestar.transform_message_for_verify(
             {"method": "scope_goto", "params": [12.3, 45.6]}
         )
         assert out["params"] == [[12.3, 45.6], "verify"]
-
         wheel = seestar.transform_message_for_verify(
             {"method": "set_wheel_position", "params": [1]}
         )
         assert wheel["params"] == [1, "verify"]
+
+        # 7.06+ firmware: verify must NOT be injected into list params either
+        # ([list, "verify"] -> code 107). Returned unchanged -- this is the
+        # pi_set_time / clock fix.
+        seestar.firmware_ver_int = 2706
+        assert seestar.transform_message_for_verify(
+            {"method": "scope_goto", "params": [12.3, 45.6]}
+        )["params"] == [12.3, 45.6]
+        assert seestar.transform_message_for_verify(
+            {"method": "pi_set_time", "params": [{"year": 2026}]}
+        )["params"] == [{"year": 2026}]
     finally:
         Config.verify_injection = old_setting
 
@@ -1969,3 +1981,40 @@ def test_start_stack_set_stack_type_failure_is_non_fatal(monkeypatch, seestar):
     assert "set_stack_type" in calls
     assert "iscope_start_stack" in calls
     assert result is True
+
+
+def test_start_stack_succeeds_despite_gain_set_error(seestar):
+    """Regression: a started stack must not be aborted because the trailing
+    set_control_value(gain) call errors (firmware 7.75 'expected string param').
+    See start_stack collapse: first target finished in 0.4s and got skipped."""
+    seen = []
+
+    def fake_send(payload):
+        seen.append(payload)
+        method = payload.get("method")
+        if method == "iscope_start_stack":
+            return {"jsonrpc": "2.0", "method": method, "result": 0, "code": 0}
+        if method == "set_control_value":
+            # firmware rejects an int gain with code 105
+            return {"jsonrpc": "2.0", "method": method, "code": 105,
+                    "error": "expected string param"}
+        return {"result": 0}
+
+    seestar.send_message_param_sync = fake_send
+    ok = seestar.start_stack({"gain": 80, "restart": True})
+    assert ok is True, "stack started -> start_stack must report success"
+    # gain must be sent as a string so fw 7.75 accepts it
+    gain_calls = [p for p in seen if p.get("method") == "set_control_value"]
+    assert gain_calls, "gain should still be set"
+    assert gain_calls[0]["params"] == ["gain", "80"], "gain value must be a string"
+
+
+def test_start_stack_fails_when_stack_command_errors(seestar):
+    """If the stack command itself errors on both attempts, start_stack returns False."""
+    def fake_send(payload):
+        if payload.get("method") == "iscope_start_stack":
+            return {"code": 1, "error": "boom"}
+        return {"result": 0}
+
+    seestar.send_message_param_sync = fake_send
+    assert seestar.start_stack({"gain": 80, "restart": True}) is False
