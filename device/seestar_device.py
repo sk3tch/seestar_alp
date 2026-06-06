@@ -26,6 +26,11 @@ from pyhocon import ConfigFactory
 
 from device.abstract_device import MessageParams, StartStackParams, Schedule
 from device.config import Config
+from device.dawn_guard import (
+    parse_local_time,
+    should_park_for_dawn,
+    sun_altitude_deg,
+)
 from device.version import Version  # type: ignore
 from device.seestar_util import Util
 from device.event_callbacks import *
@@ -125,6 +130,11 @@ class Seestar:
 
         self.mosaic_thread: Optional[threading.Thread] = None
         self.scheduler_thread: Optional[threading.Thread] = None
+        # Dawn-park safety guard (see dawn_guard_thread_fn). Armed when a
+        # schedule starts; fires at most once per schedule run.
+        self.dawn_guard_thread: Optional[threading.Thread] = None
+        self._dawn_guard_armed: bool = False
+        self._dawn_guard_fired: bool = False
         self.schedule: Schedule = {
             "version": 1.0,
             "Event": "Scheduler",
@@ -2345,6 +2355,11 @@ class Seestar:
         else:
             self.schedule["item_number"] = 1
 
+        # Arm the dawn-park guard for this run (re-arm and clear the once-fired
+        # latch so a fresh schedule gets a fresh dawn park).
+        self._dawn_guard_armed = True
+        self._dawn_guard_fired = False
+
         self.scheduler_thread = threading.Thread(
             target=lambda: self.scheduler_thread_fn(), daemon=True
         )
@@ -2669,6 +2684,63 @@ class Seestar:
             if "events" in hook and "execute" in hook:
                 self.event_callbacks.append(UserScriptEvent(self, initial_state, hook))
 
+    def dawn_guard_thread_fn(self) -> None:
+        """Independent watchdog that parks the scope at dawn.
+
+        Runs regardless of scheduler state, so it still fires if the scheduler
+        is stuck idle (e.g. after a firmware self-cancel left the stack dead) or
+        blocked for hours inside a mosaic panel. Armed by ``start_scheduler``;
+        fires at most once per schedule run. Never raises out of the loop.
+        """
+        self.logger.info(
+            "Dawn guard watchdog started (park_at_dawn=%s, dawn_sun_alt_deg=%s, hard_time=%r)",
+            Config.scheduler_park_at_dawn,
+            Config.scheduler_dawn_sun_alt_deg,
+            Config.scheduler_park_hard_local_time,
+        )
+        while True:
+            try:
+                if Config.scheduler_park_at_dawn and self._dawn_guard_armed and not self._dawn_guard_fired:
+                    lat, lon = Config.init_lat, Config.init_long
+                    # Without a trustworthy location we can't use the sun trigger;
+                    # pass an "unknown, very low" altitude so only the hard-time
+                    # fallback can fire.
+                    if lat == 0 and lon == 0:
+                        sun_alt = -90.0
+                    else:
+                        sun_alt = sun_altitude_deg(lat, lon, datetime.utcnow())
+
+                    park, reason = should_park_for_dawn(
+                        enabled=Config.scheduler_park_at_dawn,
+                        armed=self._dawn_guard_armed,
+                        already_fired=self._dawn_guard_fired,
+                        now_local=datetime.now(),
+                        sun_alt_deg=sun_alt,
+                        dawn_sun_alt_deg=Config.scheduler_dawn_sun_alt_deg,
+                        hard_local_time=parse_local_time(
+                            Config.scheduler_park_hard_local_time
+                        ),
+                    )
+                    if park:
+                        # Latch first so a slow park can't double-fire.
+                        self._dawn_guard_fired = True
+                        self._dawn_guard_armed = False
+                        self.logger.warning("Dawn guard: parking scope — %s", reason)
+                        self.event_state["scheduler"]["cur_scheduler_item"][
+                            "action"
+                        ] = f"dawn guard parked scope ({reason})"
+                        try:
+                            self.stop_scheduler({})
+                        except Exception:
+                            self.logger.exception(
+                                "Dawn guard: stop_scheduler failed (continuing to park)"
+                            )
+                        self.send_message_param_sync({"method": "scope_park"})
+                        self.logger.warning("Dawn guard: scope_park issued.")
+            except Exception:
+                self.logger.exception("Dawn guard thread error (continuing)")
+            time.sleep(60)
+
     def start_watch_thread(self):
         # only bail if is_watch_events is true
         if self.is_watch_events:
@@ -2698,6 +2770,14 @@ class Seestar:
                 )
                 self.get_msg_thread.name = f"IncomingMsgThread:{self.device_name}"
                 self.get_msg_thread.start()
+
+                # Dawn-park safety watchdog (independent of the scheduler).
+                if self.dawn_guard_thread is None:
+                    self.dawn_guard_thread = threading.Thread(
+                        target=self.dawn_guard_thread_fn, daemon=True
+                    )
+                    self.dawn_guard_thread.name = f"DawnGuardThread:{self.device_name}"
+                    self.dawn_guard_thread.start()
 
                 self.heartbeat_msg_thread = threading.Thread(
                     target=self.heartbeat_message_thread_fn, daemon=True

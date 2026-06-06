@@ -232,6 +232,26 @@ class _Config:
         # Path to PEM key used for Seestar firmware 7.18+ challenge-response authentication
         self.seestar_interop_pem: str = self.get_toml(section, "interop_pem", "")
 
+        # --- Dawn-park safety guard (device/dawn_guard.py) ---------------------
+        # An independent watchdog parks the scope at dawn so a night's schedule
+        # can never leave the telescope tracking/exposing into daylight, even if
+        # the scheduler stalls, sits idle after a firmware self-cancel, or is
+        # blocked inside a multi-hour mosaic panel.
+        sched_section = "scheduler"
+        self.scheduler_park_at_dawn: bool = self.get_toml(
+            sched_section, "park_at_dawn", True
+        )
+        # Park once the sun climbs to/above this altitude (deg). -2 is just
+        # before sunrise: safely ahead of direct sun on the optics.
+        self.scheduler_dawn_sun_alt_deg: float = self.get_toml(
+            sched_section, "dawn_sun_alt_deg", -2.0
+        )
+        # Optional absolute "HH:MM" fallback that parks even if the location/
+        # clock is wrong and the sun calc can't be trusted. "" disables it.
+        self.scheduler_park_hard_local_time: str = self.get_toml(
+            sched_section, "park_hard_local_time", ""
+        )
+
     def load_from_form(self, req):
         """
         Save the config html form into a toml file

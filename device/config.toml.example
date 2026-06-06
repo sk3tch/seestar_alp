@@ -70,6 +70,17 @@ max_size_mb = 5
 num_keep_logs = 10
 log_events_in_info = true
 
+[scheduler]
+# Dawn-park safety: an independent watchdog parks the scope at dawn so a night's
+# schedule can never leave it tracking/exposing into daylight, even if the
+# scheduler stalls, sits idle after a firmware self-cancel, or is mid-mosaic.
+park_at_dawn = true
+# Park once the sun reaches this altitude (deg). -2 ≈ just before sunrise.
+dawn_sun_alt_deg = -2.0
+# Optional absolute "HH:MM" fallback (local) if the location/clock is wrong.
+# Empty disables it.
+park_hard_local_time = ""
+
 [[seestars]]
 name = "Seestar Alpha"
 # ip_address should not have to be changed unless you have more than 1 seestar
